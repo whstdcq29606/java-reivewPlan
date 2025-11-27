@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.wuhaosen.user.domin.dao.mappers.UserMapper">
+    <resultMap id="BaseResultMap" type="com.wuhaosen.user.domin.User">
+        <result column="id" jdbcType="BIGINT" property="id"/>
+        <result column="username" jdbcType="VARCHAR" property="username"/>
+        <result column="password" jdbcType="VARCHAR" property="password"/>
+        <result column="email" jdbcType="VARCHAR" property="email"/>
+        <result column="phone" jdbcType="VARCHAR" property="phone"/>
+        <result column="amount" jdbcType="DECIMAL" property="amount"/>
+        <result column="is_vip" jdbcType="SMALLINT" property="isVip"/>
+        <result column="create_time" jdbcType="TIMESTAMP" property="createTime"/>
+        <result column="update_time" jdbcType="TIMESTAMP" property="updateTime"/>
+        <result column="last_login_time" jdbcType="TIMESTAMP" property="lastLoginTime"/>
+
+    </resultMap>
+    <select id="findAll" resultType="User">
+        SELECT * FROM users
+    </select>
+
+    <select id="findById" parameterType="Long" resultType="User">
+        SELECT * FROM users WHERE id = #{id}
+    </select>
+
+    <insert id="insert" parameterType="User">
+        INSERT INTO users (username, email) VALUES (#{username}, #{email})
+    </insert>
+
+    <update id="update" parameterType="User">
+        UPDATE users SET username = #{username}, email = #{email} WHERE id = #{id}
+    </update>
+
+    <delete id="delete" parameterType="Long">
+        DELETE FROM users WHERE id = #{id}
+    </delete>
+</mapper>
