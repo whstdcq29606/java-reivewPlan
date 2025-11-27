@@ -1,4 +1,4 @@
-name: Test Environment Deploy (No Tags)
+name: Test Environment Deploy (No Tags + No Master Pollution)
 
 # 触发条件：仅手动按钮触发（无需标签）
 on:
@@ -23,7 +23,7 @@ on:
         default: true
 
 jobs:
-  # 步骤1：更新「集成清单」（features.json）
+  # 步骤1：更新「集成清单」（缓存存储，不提交到master）
   update-integration-list:
     runs-on: ubuntu-latest
     outputs:
@@ -33,27 +33,37 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0  # 拉取所有分支
-          token: ${{ secrets.GITHUB_TOKEN }}  # 显式指定令牌，确保push权限
+          token: ${{ secrets.GITHUB_TOKEN }}  # 显式指定令牌，确保操作权限
 
-      # 新增：安装jq（解析JSON必需，修复"jq: command not found"错误）
+      # 安装jq（解析JSON必需）
       - name: Install jq (JSON parser)
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: 确保状态文件目录存在
-        run: mkdir -p .test-env
+      # 关键：从GitHub缓存恢复集成清单（避免提交到master）
+      - name: 恢复集成清单缓存
+        uses: actions/cache@v3
+        id: cache-features
+        with:
+          path: .test-env/features.json  # 缓存的文件路径
+          key: ${{ runner.os }}-test-env-features  # 唯一缓存标识（按系统区分）
+          restore-keys: |
+            ${{ runner.os }}-test-env-features
 
-      - name: 初始化状态文件（若不存在）
+      # 初始化集成清单（缓存未命中时创建空文件）
+      - name: 初始化集成清单（缓存未命中）
         run: |
+          mkdir -p .test-env  # 确保目录存在
           if [ ! -f .test-env/features.json ]; then
             echo "[]" > .test-env/features.json
-            echo "✅ 初始化集成清单文件"
+            echo "✅ 初始化集成清单（缓存未命中）"
           fi
 
-      - name: 更新集成清单（加入/退出分支）
+      # 更新集成清单（加入/退出分支）
+      - name: 更新集成清单逻辑
         id: update-list
         run: |
-          # 读取当前集成清单（直接读取JSON，避免空数组处理异常）
-          CURRENT_JSON=$(cat .test-env/features.json)
+          # 读取当前清单（压缩JSON，避免格式问题）
+          CURRENT_JSON=$(cat .test-env/features.json | jq -c .)
           TARGET_BRANCH="${{ github.event.inputs.featureBranch }}"
           ACTION="${{ github.event.inputs.action }}"
 
@@ -63,68 +73,63 @@ jobs:
             exit 1
           fi
 
-          # 核心修复：用jq直接操作JSON数组，避免空字符串问题
+          # 加入分支：不存在则添加
           if [ "$ACTION" == "加入Test环境" ]; then
-            # 加入：判断分支是否已在数组中，不存在则添加
-            NEW_JSON=$(echo "$CURRENT_JSON" | jq --arg branch "$TARGET_BRANCH" '
+            NEW_JSON=$(echo "$CURRENT_JSON" | jq --arg branch "$TARGET_BRANCH" -c '
               if index($branch) then . else . + [$branch] end
             ')
             echo "✅ 已将 $TARGET_BRANCH 加入Test环境集成清单"
+          # 退出分支：存在则删除
           else
-            # 退出：从数组中删除分支（不存在则不改变）
-            NEW_JSON=$(echo "$CURRENT_JSON" | jq --arg branch "$TARGET_BRANCH" '
+            NEW_JSON=$(echo "$CURRENT_JSON" | jq --arg branch "$TARGET_BRANCH" -c '
               map(select(. != $branch))
             ')
             echo "✅ 已将 $TARGET_BRANCH 退出Test环境集成清单"
           fi
 
-          # 写入更新后的清单到文件（格式化JSON，便于查看）
+          # 写入更新后的清单到本地文件（后续存入缓存）
           echo "$NEW_JSON" | jq . > .test-env/features.json
-          # 输出当前清单（供后续步骤使用，确保格式正确）
+          # 输出给后续步骤使用
           echo "list=$NEW_JSON" >> $GITHUB_OUTPUT
 
-      - name: 提交更新后的集成清单
-        run: |
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
-          git add .test-env/features.json
-          # 若文件无变更（如重复加入/退出不存在的分支），则不提交
-          if git diff --cached --quiet; then
-            echo "ℹ️  集成清单无变更，无需提交"
-          else
-            git commit -m "TestEnv: ${{ github.event.inputs.action }} ${{ github.event.inputs.featureBranch }}"
-            git push origin ${{ github.ref }}  # 推送到当前分支（master）
-          fi
+      # 关键：保存更新后的清单到缓存（覆盖旧缓存，确保下次能读取）
+      - name: 保存集成清单到缓存
+        if: always()  # 即使前面步骤失败，也保存缓存（避免数据丢失）
+        uses: actions/cache/save@v3
+        with:
+          path: .test-env/features.json
+          key: ${{ runner.os }}-test-env-features
 
-      - name: 输出最终集成清单
+      # 输出最终集成清单（日志可见）
+      - name: 输出当前集成分支
         id: get-features
         run: |
-          FINAL_LIST=$(cat .test-env/features.json)
+          FINAL_LIST=$(cat .test-env/features.json | jq -c .)
           echo "list=$FINAL_LIST" >> $GITHUB_OUTPUT
-          echo "当前待集成到Test环境的分支：$FINAL_LIST"
+          echo "📋 当前待集成到Test环境的分支：$FINAL_LIST"
 
-  # 步骤2：创建临时Test分支（聚合清单中的所有Feature）
+  # 步骤2：创建临时Test分支（聚合所有Feature分支）
   create-temp-test-branch:
     runs-on: ubuntu-latest
     needs: update-integration-list
-    # 兼容所有Actions版本的条件判断
+    # 兼容所有Actions版本的条件判断（非空才执行）
     if: ${{ github.event.inputs.deployNow == true && join(fromJSON(needs.update-integration-list.outputs.currentFeatures)) != '' }}
     outputs:
       tempBranch: ${{ steps.create-branch.outputs.name }}
     steps:
-      - name: Checkout 代码
+      - name: Checkout 代码（基于master分支）
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: master  # 基于master分支创建临时Test分支
+          ref: master
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 配置Git
+      - name: 配置Git身份（用于创建分支和提交）
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
 
-      - name: 创建临时Test分支
+      - name: 创建临时Test分支（时间戳确保唯一）
         id: create-branch
         run: |
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
@@ -133,9 +138,9 @@ jobs:
           echo "name=$TEMP_BRANCH" >> $GITHUB_OUTPUT
           echo "✅ 创建临时Test分支：$TEMP_BRANCH"
 
-      - name: 合并清单中的所有Feature分支
+      - name: 合并集成清单中的所有Feature分支
         run: |
-          # 解析集成清单中的分支列表（直接用jq解析JSON，避免空字符串）
+          # 解析缓存中的分支列表
           FEATURES=$(echo '${{ needs.update-integration-list.outputs.currentFeatures }}' | jq -r '.[]')
           for BRANCH in $FEATURES; do
             # 跳过空字符串（防止异常）
@@ -145,12 +150,16 @@ jobs:
             git fetch origin $BRANCH:refs/remotes/origin/$BRANCH
             # 合并失败（冲突）则终止，提示手动解决
             if ! git merge origin/$BRANCH --no-edit; then
-              echo "❌ 合并 $BRANCH 时发生冲突，请手动解决后重新触发部署"
+              echo "❌ 合并 $BRANCH 时发生冲突，请按以下步骤解决："
+              echo "1. 本地拉取临时分支：git pull origin ${{ steps.create-branch.outputs.name }}"
+              echo "2. 解决冲突：git mergetool 或手动编辑冲突文件"
+              echo "3. 提交并推送：git add . && git commit -m 'fix: resolve merge conflict' && git push"
+              echo "4. 重新触发工作流部署"
               exit 1
             fi
           done
-          # 推送临时分支到远程（便于调试和后续部署）
-          git push -u origin $TEMP_BRANCH
+          # 推送临时分支到远程（便于部署和调试）
+          git push -u origin ${{ steps.create-branch.outputs.name }}
 
   # 步骤3：部署到Test环境（替换为你的实际部署命令）
   deploy-to-test:
@@ -164,57 +173,85 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 部署Test环境
+      - name: 部署到Test环境
         env:
-          # 测试环境配置（从GitHub Secrets读取，需提前在仓库设置）
+          # 测试环境敏感配置（从GitHub Secrets读取，需提前设置）
           TEST_DB_URL: ${{ secrets.TEST_DB_URL }}
           TEST_API_KEY: ${{ secrets.TEST_API_KEY }}
-          # 若部署到服务器，需添加SSH相关密钥（示例）
+          # 若部署到服务器，添加SSH相关配置（示例）
           # TEST_SERVER_SSH_KEY: ${{ secrets.TEST_SERVER_SSH_KEY }}
           # TEST_SERVER_HOST: ${{ secrets.TEST_SERVER_HOST }}
           # TEST_SERVER_USER: ${{ secrets.TEST_SERVER_USER }}
+          # TEST_SERVER_APP_DIR: ${{ secrets.TEST_SERVER_APP_DIR }}  # 服务器项目目录
         run: |
           echo "🚀 开始部署临时分支 ${{ needs.create-temp-test-branch.outputs.tempBranch }} 到Test环境"
           
-          # ===================== 替换为你的部署命令 =====================
-          # 示例1：前端项目（如Vue/React）部署到Vercel Preview
+          # ===================== 替换为你的实际部署命令 =====================
+          # 示例1：前端项目（Vue/React/Angular）部署到云厂商静态托管（如阿里云OSS、Vercel）
           # npm install
           # npm run build
-          # npm install -g vercel
-          # vercel deploy --preview --token ${{ secrets.VERCEL_TOKEN }} --env TEST_DB_URL=$TEST_DB_URL
+          # # 阿里云OSS示例（需安装ossutil）
+          # wget https://gosspublic.alicdn.com/ossutil/1.7.19/ossutil64 -O /usr/local/bin/ossutil
+          # chmod +x /usr/local/bin/ossutil
+          # ossutil config -i ${{ secrets.ALIYUN_ACCESS_KEY }} -k ${{ secrets.ALIYUN_SECRET_KEY }} -e oss-cn-beijing.aliyuncs.com
+          # ossutil cp -r dist/ oss://你的bucket名称/ --force
           
-          # 示例2：后端项目（如Node.js/Python）部署到测试服务器（SSH方式）
+          # 示例2：后端项目（Node.js/Python/Java）部署到测试服务器（SSH方式）
+          # # 写入SSH密钥并设置权限
           # echo "$TEST_SERVER_SSH_KEY" > ~/.ssh/test_server_key
           # chmod 600 ~/.ssh/test_server_key
+          # # SSH连接服务器并执行部署命令
           # ssh -o StrictHostKeyChecking=no -i ~/.ssh/test_server_key $TEST_SERVER_USER@$TEST_SERVER_HOST << EOF
-          #   cd /var/app/test  # 测试服务器项目目录
+          #   cd $TEST_SERVER_APP_DIR
           #   git pull origin ${{ needs.create-temp-test-branch.outputs.tempBranch }}
-          #   npm install  # 或 pip install -r requirements.txt
-          #   pm2 restart app  # 或 systemctl restart test-service
+          #   # 根据项目类型执行依赖安装和重启命令
+          #   npm install  # Node.js项目
+          #   # pip install -r requirements.txt  # Python项目
+          #   # ./gradlew build  # Java Gradle项目
+          #   pm2 restart test-app  # 重启服务（根据你的进程管理工具调整）
           # EOF
           
-          # 示例3：Docker部署（本地构建镜像推送到测试环境）
-          # docker build -t test-app:${{ needs.create-temp-test-branch.outputs.tempBranch }} .
-          # docker tag test-app:${{ needs.create-temp-test-branch.outputs.tempBranch }} 你的镜像仓库地址
-          # docker push 你的镜像仓库地址
-          # ssh -o StrictHostKeyChecking=no $TEST_SERVER_USER@$TEST_SERVER_HOST "docker pull 你的镜像仓库地址 && docker-compose restart test-app"
+          # 示例3：Docker容器部署（本地构建镜像推送到测试环境）
+          # # 登录Docker仓库（如阿里云容器镜像服务）
+          # docker login --username ${{ secrets.DOCKER_USERNAME }} --password ${{ secrets.DOCKER_PASSWORD }} 你的镜像仓库地址
+          # # 构建镜像
+          # docker build -t 你的镜像仓库地址/test-app:${{ needs.create-temp-test-branch.outputs.tempBranch }} .
+          # # 推送镜像
+          # docker push 你的镜像仓库地址/test-app:${{ needs.create-temp-test-branch.outputs.tempBranch }}
+          # # 远程服务器拉取镜像并重启容器
+          # ssh -o StrictHostKeyChecking=no $TEST_SERVER_USER@$TEST_SERVER_HOST << EOF
+          #   docker pull 你的镜像仓库地址/test-app:${{ needs.create-temp-test-branch.outputs.tempBranch }}
+          #   docker-compose down && docker-compose up -d
+          # EOF
           # ==============================================================
 
           echo "✅ Test环境部署命令执行完成！"
 
-      - name: 部署结果通知（可选）
+      # 步骤4：部署结果通知（可选，根据团队需求配置）
+      - name: 通知部署结果
         run: |
-          # 替换为你的通知方式（企业微信/Slack/邮件等）
-          NOTIFY_CONTENT="✅ Test环境更新成功！
+          # 拼接通知内容
+          NOTIFY_CONTENT="📢 Test环境部署完成！
           - 操作类型：${{ github.event.inputs.action }}
           - 目标分支：${{ github.event.inputs.featureBranch }}
           - 临时Test分支：${{ needs.create-temp-test-branch.outputs.tempBranch }}
-          - 当前集成分支：${{ needs.update-integration-list.outputs.currentFeatures }}"
+          - 当前集成分支：${{ needs.update-integration-list.outputs.currentFeatures }}
+          - 部署时间：$(date +'%Y-%m-%d %H:%M:%S')"
           
-          # 企业微信通知示例（需在GitHub Secrets添加 WECHAT_WEBHOOK）
-          # curl -H "Content-Type: application/json" -d "{
-          #   \"msgtype\":\"text\",
-          #   \"text\":{\"content\":\"$NOTIFY_CONTENT\"}
-          # }" ${{ secrets.WECHAT_WEBHOOK }}
-          
+          # 输出到日志
           echo "$NOTIFY_CONTENT"
+          
+          # 可选：企业微信通知（需在GitHub Secrets添加 WECHAT_WEBHOOK）
+          # if [ -n "${{ secrets.WECHAT_WEBHOOK }}" ]; then
+          #   curl -H "Content-Type: application/json" -d "{
+          #     \"msgtype\":\"text\",
+          #     \"text\":{\"content\":\"$NOTIFY_CONTENT\"}
+          #   }" ${{ secrets.WECHAT_WEBHOOK }}
+          # fi
+          
+          # 可选：Slack通知（需添加 SLACK_WEBHOOK）
+          # if [ -n "${{ secrets.SLACK_WEBHOOK }}" ]; then
+          #   curl -H "Content-Type: application/json" -d "{
+          #     \"text\":\"$NOTIFY_CONTENT\"
+          #   }" ${{ secrets.SLACK_WEBHOOK }}
+          # fi
