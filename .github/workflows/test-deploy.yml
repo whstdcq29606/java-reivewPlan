@@ -1,0 +1,167 @@
+name: Test Environment Deploy (No Tags)
+
+# 触发条件：仅手动按钮触发（无需标签）
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: '操作类型'
+        required: true
+        type: choice
+        options:
+          - 加入Test环境
+          - 退出Test环境
+      featureBranch:
+        description: 'Feature分支名（格式：feature/xxx，如 feature/user-login）'
+        required: true
+        default: 'feature/user-login'
+      # 可选：是否立即部署（默认是）
+      deployNow:
+        description: '操作后立即部署Test环境？'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  # 步骤1：更新「集成清单」（features.json）
+  update-integration-list:
+    runs-on: ubuntu-latest
+    outputs:
+      currentFeatures: ${{ steps.get-features.outputs.list }}  # 输出当前待集成的分支列表
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 拉取所有分支
+
+      - name: 确保状态文件目录存在
+        run: mkdir -p .test-env
+
+      - name: 初始化状态文件（若不存在）
+        run: |
+          if [ ! -f .test-env/features.json ]; then
+            echo "[]" > .test-env/features.json
+            echo "✅ 初始化集成清单文件"
+          fi
+
+      - name: 更新集成清单（加入/退出分支）
+        id: update-list
+        run: |
+          # 读取当前集成清单
+          CURRENT_FEATURES=$(cat .test-env/features.json | jq -r '.[]')
+          TARGET_BRANCH="${{ github.event.inputs.featureBranch }}"
+          ACTION="${{ github.event.inputs.action }}"
+
+          # 验证分支格式（必须是 feature/xxx）
+          if [[ ! $TARGET_BRANCH =~ ^feature/ ]]; then
+            echo "❌ 分支格式错误！必须以 feature/ 开头"
+            exit 1
+          fi
+
+          # 加入：分支不在列表中则添加
+          if [ "$ACTION" == "加入Test环境" ]; then
+            if echo "$CURRENT_FEATURES" | grep -q "$TARGET_BRANCH"; then
+              echo "⚠️  分支 $TARGET_BRANCH 已在Test环境中，无需重复加入"
+              NEW_LIST=$(echo "$CURRENT_FEATURES" | jq -R . | jq -s .)
+            else
+              NEW_LIST=$(echo "$CURRENT_FEATURES" | jq -R . | jq -s '. + ["'$TARGET_BRANCH'"]')
+              echo "✅ 已将 $TARGET_BRANCH 加入Test环境集成清单"
+            fi
+          # 退出：分支在列表中则删除
+          else
+            NEW_LIST=$(echo "$CURRENT_FEATURES" | jq -R . | jq -s 'map(select(. != "'$TARGET_BRANCH'"))')
+            echo "✅ 已将 $TARGET_BRANCH 退出Test环境集成清单"
+          fi
+
+          # 写入更新后的清单到文件
+          echo "$NEW_LIST" | jq . > .test-env/features.json
+          # 输出当前清单（供后续步骤使用）
+          echo "list=$NEW_LIST" >> $GITHUB_OUTPUT
+
+      - name: 提交更新后的集成清单
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git add .test-env/features.json
+          # 若文件无变更（如重复加入），则不提交
+          if git diff --cached --quiet; then
+            echo "ℹ️  集成清单无变更，无需提交"
+          else
+            git commit -m "TestEnv: ${{ github.event.inputs.action }} ${{ github.event.inputs.featureBranch }}"
+            git push origin ${{ github.ref }}  # 推送到当前分支（触发工作流的分支，通常是main）
+          fi
+
+      - name: 输出最终集成清单
+        id: get-features
+        run: |
+          FINAL_LIST=$(cat .test-env/features.json)
+          echo "list=$FINAL_LIST" >> $GITHUB_OUTPUT
+          echo "当前待集成到Test环境的分支：$FINAL_LIST"
+
+  # 步骤2：创建临时Test分支（聚合清单中的所有Feature）
+  create-temp-test-branch:
+    runs-on: ubuntu-latest
+    needs: update-integration-list
+    if: ${{ github.event.inputs.deployNow == true && fromJSON(needs.update-integration-list.outputs.currentFeatures) != [] }}
+    outputs:
+      tempBranch: ${{ steps.create-branch.outputs.name }}
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main  # 基于main分支创建临时Test分支
+
+      - name: 配置Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: 创建临时Test分支
+        id: create-branch
+        run: |
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          TEMP_BRANCH="temp-test-$TIMESTAMP"
+          git checkout -b $TEMP_BRANCH main
+          echo "name=$TEMP_BRANCH" >> $GITHUB_OUTPUT
+          echo "✅ 创建临时Test分支：$TEMP_BRANCH"
+
+      - name: 合并清单中的所有Feature分支
+        run: |
+          FEATURES=$(echo '${{ needs.update-integration-list.outputs.currentFeatures }}' | jq -r '.[]')
+          for BRANCH in $FEATURES; do
+            echo "🔄 正在合并分支：$BRANCH"
+            git fetch origin $BRANCH:refs/remotes/origin/$BRANCH
+            # 合并失败（冲突）则终止，提示手动解决
+            if ! git merge origin/$BRANCH --no-edit; then
+              echo "❌ 合并 $BRANCH 时发生冲突，请手动解决后重新触发部署"
+              exit 1
+            fi
+          done
+          # 推送临时分支到远程（便于调试）
+          git push -u origin $TEMP_BRANCH
+
+  # 步骤3：部署到Test环境（与之前逻辑一致，替换为你的部署命令）
+  deploy-to-test:
+    runs-on: ubuntu-latest
+    needs: create-temp-test-branch
+    steps:
+      - name: Checkout 临时Test分支
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.create-temp-test-branch.outputs.tempBranch }}
+          fetch-depth: 0
+
+      - name: 部署Test环境
+        env:
+          TEST_DB_URL: ${{ secrets.TEST_DB_URL }}
+        run: |
+          echo "🚀 部署临时分支 ${{ needs.create-temp-test-branch.outputs.tempBranch }} 到Test环境"
+          # 替换为你的实际部署命令（如SSH、云厂商CLI等）
+          # npm install && npm run build && vercel deploy --preview --token ${{ secrets.VERCEL_TOKEN }}
+
+      - name: 通知部署完成
+        run: |
+          echo "✅ Test环境部署完成！当前集成分支：${{ needs.update-integration-list.outputs.currentFeatures }}"
+          # 可选：企业微信/Slack通知（替换为你的webhook）
+          # curl -H "Content-Type: application/json" -d '{"msgtype":"text","text":{"content":"Test环境更新：${{ needs.update-integration-list.outputs.currentFeatures }}"}}' ${{ secrets.WECHAT_WEBHOOK }}
