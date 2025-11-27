@@ -107,8 +107,8 @@ jobs:
   create-temp-test-branch:
     runs-on: ubuntu-latest
     needs: update-integration-list
-    # 修复语法错误：用length判断数组非空
-    if: ${{ github.event.inputs.deployNow == true && length(fromJSON(needs.update-integration-list.outputs.currentFeatures)) > 0 }}
+    # 修复：用join转字符串判断非空（兼容所有GitHub Actions版本）
+    if: ${{ github.event.inputs.deployNow == true && join(fromJSON(needs.update-integration-list.outputs.currentFeatures)) != '' }}
     outputs:
       tempBranch: ${{ steps.create-branch.outputs.name }}
     steps:
